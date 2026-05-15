@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Simulador Lógico Avançado</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app-container">
+    <header>
+        <h3>Simulador Lógico</h3>
+        <div id="cycles-badge">Estável</div>
+    </header>
+    
+    <div id="toolbar">
+        <button class="btn active" data-mode="select">➔ Mover</button>
+        <button class="btn" data-mode="wire">⚡ Fio Manual</button>
+        <button class="btn" data-mode="delete">🗑️ Deletar</button>
+        <button class="btn" data-mode="config">⚙️ Editar</button>
+        <button class="btn" data-mode="add">➕ Add Componente</button>
+    </div>
+    
+    <div id="canvas-container">
+        <canvas id="logicCanvas"></canvas>
+        <div id="toast"></div>
+        <div id="zoom-info">Zoom: 100%</div>
+    </div>
+    
+    <div id="config-panel">
+        <div style="display:flex; justify-content:space-between; margin-bottom:10px;">
+            <strong>Modificar Elemento</strong>
+            <span style="cursor:pointer" onclick="closeConfig()">✕</span>
+        </div>
+        <div class="form-group">
+            <label>Tipo de Componente</label>
+            <select id="gate-type-select" onchange="updateConfigFields(this.value)">
+                <option value="AND">AND</option>
+                <option value="OR">OR</option>
+                <option value="NOT">NOT</option>
+                <option value="NAND">NAND</option>
+                <option value="NOR">NOR</option>
+                <option value="XOR">XOR</option>
+                <option value="XNOR">XNOR</option>
+                <option value="INPUT_BTN">Botão de Entrada</option>
+                <option value="OUTPUT_LED">LED de Saída</option>
+                <option value="BINARY_COUNTER">Contador Binário</option>
+                <option value="HEX_DISPLAY">Display Hexadecimal</option>
+            </select>
+        </div>
+        <div class="form-group" id="pin-count-group">
+            <label id="pin-count-label">Quantidade de Entradas</label>
+            <input type="number" id="gate-inputs-count" min="1" max="32">
+        </div>
+        <div class="form-group">
+            <label>Multiplicador de Tamanho</label>
+            <input type="number" id="gate-scale" step="0.1" min="0.5" max="3">
+        </div>
+        <button class="btn" style="width:100%; justify-content:center; background:var(--accent-color)" onclick="applyGateConfig()">Salvar</button>
+    </div>
+</div>
+
+<script src="script.js"></script>
+<script>
+function updateConfigFields(type) {
+    const group = document.getElementById('pin-count-group');
+    const label = document.getElementById('pin-count-label');
+    
+    if (type === 'INPUT_BTN' || type === 'OUTPUT_LED') {
+        group.style.display = 'none';
+    } else {
+        group.style.display = 'flex';
+        if (type === 'BINARY_COUNTER') {
+            label.textContent = 'Quantidade de Saídas';
+        } else {
+            label.textContent = 'Quantidade de Entradas';
+        }
+    }
+}
+
+const originalOpenConfig = window.openConfig;
+window.openConfig = function(gate) {
+    if (typeof originalOpenConfig === 'function') {
+        originalOpenConfig(gate);
+    }
+    setTimeout(() => {
+        const typeSelect = document.getElementById('gate-type-select');
+        if (typeSelect) {
+            updateConfigFields(typeSelect.value);
+        }
+    }, 10);
+};
+</script>
+</body>
+</html>
