@@ -145,79 +145,155 @@ function updateInputLabels() {
 }
 
 function evaluateCircuit() {
-    let maxCycles = 10, stabilized = false, cycleCount = 0;
+    let maxCycles = 15, stabilized = false, cycleCount = 0;
+
     while (!stabilized && cycleCount < maxCycles) {
-        let changed = false, inputSignals = {}, outputSignals = {};
-        
+        let changed = false;
+
+        // 1. MAPEAMENTO DE MALHAS (NETS) - Unifica os pinos interconectados
+        let pinToNetId = {};
+        let nextNetId = 0;
+
         wires.forEach(wire => {
-            let srcVal = false, srcGate = gates.find(g => g.id === wire.from.gateId);
-            if (srcGate) {
-                if (srcGate.type === 'BINARY_COUNTER') {
-                    srcVal = ((srcGate.counterValue >> wire.from.index) & 1) === 1;
-                } else {
-                    srcVal = (wire.from.type === 'out') ? srcGate.outputValue : srcGate.manualInputs[wire.from.index];
+            const p1 = `${wire.from.gateId}_${wire.from.type}_${wire.from.index}`;
+            const p2 = `${wire.to.gateId}_${wire.to.type}_${wire.to.index}`;
+
+            const net1 = pinToNetId[p1];
+            const net2 = pinToNetId[p2];
+
+            if (net1 !== undefined && net2 !== undefined) {
+                if (net1 !== net2) {
+                    for (let pin in pinToNetId) {
+                        if (pinToNetId[pin] === net2) pinToNetId[pin] = net1;
+                    }
                 }
+            } else if (net1 !== undefined) {
+                pinToNetId[p2] = net1;
+            } else if (net2 !== undefined) {
+                pinToNetId[p1] = net2;
+            } else {
+                pinToNetId[p1] = nextNetId;
+                pinToNetId[p2] = nextNetId;
+                nextNetId++;
             }
-            wire.value = srcVal;
-            const destKey = `${wire.to.gateId}_${wire.to.type}_${wire.to.index}`;
-            if (wire.to.type === 'in') { (inputSignals[destKey] = inputSignals[destKey] || []).push(srcVal); }
-            else { (outputSignals[destKey] = outputSignals[destKey] || []).push(srcVal); }
         });
 
-                gates.forEach(gate => {
+        // 2. COLETA DE SINAIS INJETADOS DA MALHA - Varre todas as fontes geradoras
+        let netValues = {};
+
+        gates.forEach(gate => {
+            // INPUT_BTN: Injeta sinal em qualquer malha conectada ao seu pino 'out 0'
+            if (gate.type === 'INPUT_BTN') {
+                const pinKey = `${gate.id}_out_0`;
+                const netId = pinToNetId[pinKey];
+                if (netId !== undefined) {
+                    netValues[netId] = netValues[netId] || [];
+                    netValues[netId].push(gate.outputValue);
+                }
+            }
+            // BINARY_COUNTER: Injeta sinal nas malhas conectadas às suas saídas
+            else if (gate.type === 'BINARY_COUNTER') {
+                for (let i = 0; i < gate.outputsCount; i++) {
+                    const pinKey = `${gate.id}_out_${i}`;
+                    const netId = pinToNetId[pinKey];
+                    if (netId !== undefined) {
+                        let bitVal = ((gate.counterValue >> i) & 1) === 1;
+                        netValues[netId] = netValues[netId] || [];
+                        netValues[netId].push(bitVal);
+                    }
+                }
+            }
+            // PORTAS LÓGICAS TRADICIONAIS: Injetam sinal na malha conectada ao seu pino 'out 0'
+            else if (gate.type !== 'OUTPUT_LED' && gate.type !== 'HEX_DISPLAY' && gate.type !== 'DISPLAY_7SEG') {
+                const pinKey = `${gate.id}_out_0`;
+                const netId = pinToNetId[pinKey];
+                if (netId !== undefined) {
+                    netValues[netId] = netValues[netId] || [];
+                    netValues[netId].push(gate.outputValue);
+                }
+            }
+        });
+
+        // 3. ATUALIZAÇÃO VISUAL DOS FIOS - Olha para qualquer ponta do fio para saber o estado da malha
+        wires.forEach(wire => {
+            const p1 = `${wire.from.gateId}_${wire.from.type}_${wire.from.index}`;
+            const p2 = `${wire.to.gateId}_${wire.to.type}_${wire.to.index}`;
+            
+            // O fio assume o valor se QUALQUER uma de suas pontas estiver conectada a uma malha energizada
+            const netId = pinToNetId[p1] !== undefined ? pinToNetId[p1] : pinToNetId[p2];
+            
+            let wireVal = false;
+            if (netId !== undefined && netValues[netId]) {
+                wireVal = netValues[netId].some(v => v);
+            }
+            wire.value = wireVal;
+        });
+
+        // 4. PROCESSAMENTO DAS PORTAS LÓGICAS
+        gates.forEach(gate => {
             let currentInputs = [];
             for (let i = 0; i < gate.inputsCount; i++) {
-                const key = `${gate.id}_in_${i}`;
-                currentInputs.push(inputSignals[key] ? inputSignals[key].some(v => v) : gate.manualInputs[i]);
+                const pinKey = `${gate.id}_in_${i}`;
+                const netId = pinToNetId[pinKey];
+                
+                if (netId !== undefined && netValues[netId]) {
+                    currentInputs.push(netValues[netId].some(v => v));
+                } else {
+                    currentInputs.push(gate.manualInputs[i]);
+                }
             }
-            
+
             let nextOutput = gate.outputValue;
+
             if (gate.type === 'INPUT_BTN' || gate.type === 'BINARY_COUNTER') {
-                nextOutput = gate.outputValue;
-            } else if (gate.type === 'HEX_DISPLAY') {
+                return; 
+            } 
+            else if (gate.type === 'HEX_DISPLAY') {
                 let decimalValue = 0;
                 currentInputs.forEach((val, idx) => {
                     if (val) decimalValue += Math.pow(2, idx);
                 });
                 gate.counterValue = decimalValue;
                 nextOutput = false;
-            } else if (gate.type === 'OUTPUT_LED') {
+            } 
+            else if (gate.type === 'OUTPUT_LED') {
                 nextOutput = currentInputs[0] || false; 
-            } else if (gate.type === 'AND') {
+            } 
+            else if (gate.type === 'AND') {
                 nextOutput = (currentInputs.length > 0 && currentInputs.every(v => v));
-            } else if (gate.type === 'OR') {
+            } 
+            else if (gate.type === 'OR') {
                 nextOutput = currentInputs.some(v => v);
-            } else if (gate.type === 'NOT') {
-                nextOutput = !currentInputs[0];
-            } else if (gate.type === 'NAND') {
+            } 
+            else if (gate.type === 'NOT') {
+                nextOutput = !currentInputs[0]; 
+            } 
+            else if (gate.type === 'NAND') {
                 nextOutput = !(currentInputs.length > 0 && currentInputs.every(v => v));
-            } else if (gate.type === 'NOR') {
+            } 
+            else if (gate.type === 'NOR') {
                 nextOutput = !currentInputs.some(v => v);
-            } else if (gate.type === 'XOR') {
+            } 
+            else if (gate.type === 'XOR') {
                 nextOutput = currentInputs.filter(v => v).length % 2 !== 0;
-            } else if (gate.type === 'XNOR') {
+            } 
+            else if (gate.type === 'XNOR') {
                 nextOutput = currentInputs.filter(v => v).length % 2 === 0;
             }
-            
-            if (gate.type !== 'BINARY_COUNTER' && gate.type !== 'HEX_DISPLAY') {
-                if (outputSignals[`${gate.id}_out_0`]) nextOutput = nextOutput || outputSignals[`${gate.id}_out_0`].some(v => v);
-            }
-            
+
             if (gate.outputValue !== nextOutput) { 
                 gate.outputValue = nextOutput; 
                 changed = true; 
             }
         });
 
-        if (!changed) stabilized = true; cycleCount++;
+        if (!changed) stabilized = true; 
+        cycleCount++;
     }
     cyclesBadge.innerText = stabilized ? "Estável" : "Loop Ativo";
     cyclesBadge.style.backgroundColor = stabilized ? "#4caf50" : "#f44336";
 }
 
-
-
-        
 
 function drawGateShape(ctx, gate) {
     ctx.save(); 
@@ -512,7 +588,7 @@ function handlePointerStart(e) {
         return;
     }
 
-        if (currentMode === 'select') {
+                if (currentMode === 'select') {
         if (hit.type === 'gate') {
             if (hit.gate.type === 'INPUT_BTN') {
                 hit.gate.outputValue = !hit.gate.outputValue;
@@ -524,11 +600,20 @@ function handlePointerStart(e) {
             selectedGate = hit.gate;
             dragOffset.x = wPos.x - hit.gate.x;
             dragOffset.y = wPos.y - hit.gate.y;
-        } else if (hit.type === 'socket' && hit.socketType === 'in' && !wires.some(w => w.to.gateId === hit.gateId && w.to.type === 'in' && w.to.index === hit.index)) {
-            const gate = gates.find(g => g.id === hit.gateId);
-            if (gate) gate.manualInputs[hit.index] = !gate.manualInputs[hit.index];
+        } else if (hit.type === 'socket' && hit.socketType === 'in') {
+            // CORREÇÃO: Verifica se o pino de entrada possui QUALQUER fio conectado a ele antes de permitir a alteração manual
+            const hasWireConnected = wires.some(w => 
+                (w.to.gateId === hit.gateId && w.to.type === 'in' && w.to.index === hit.index) ||
+                (w.from.gateId === hit.gateId && w.from.type === 'in' && w.from.index === hit.index)
+            );
+            
+            if (!hasWireConnected) {
+                const gate = gates.find(g => g.id === hit.gateId);
+                if (gate) gate.manualInputs[hit.index] = !gate.manualInputs[hit.index];
+            }
         }
-    } else if (currentMode === 'wire' && hit.type === 'socket') {
+    }
+ else if (currentMode === 'wire' && hit.type === 'socket') {
         if (!activeWireStart) {
             activeWireStart = { gateId: hit.gateId, type: hit.socketType, index: hit.index };
             activeWirePoints = [];
@@ -641,12 +726,43 @@ function render() {
             ctx.fillStyle = '#888899'; ctx.font = `${10 * gate.scale}px sans-serif`; ctx.textAlign = 'center'; ctx.fillText(gate.type, gate.x + gate.width / 2, gate.y - 6);
         }
         
-                for (let i = 0; i < gate.inputsCount; i++) {
-            const pos = gate.getSocketPos('in', i), hasWire = wires.some(w => w.to.gateId === gate.id && w.to.type === 'in' && w.to.index === i);
-            let val = hasWire ? wires.filter(w => w.to.gateId === gate.id && w.to.type === 'in' && w.to.index === i).some(w => w.value) : gate.manualInputs[i];
-            ctx.fillStyle = val ? '#00ffcc' : '#2a2a35'; ctx.strokeStyle = '#ffffff'; ctx.beginPath(); ctx.arc(pos.x, pos.y, 5 * gate.scale, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
-            if (!hasWire) { ctx.fillStyle = '#ffffff'; ctx.font = '9px sans-serif'; ctx.fillText(val ? "1" : "0", pos.x - 10, pos.y + 3); }
+                        // -------------------------------------------------------------------------
+        // TRECHO CORRIGIDO DENTRO DO RENDER PARA ENTRADAS BIDIRECIONAIS
+        // -------------------------------------------------------------------------
+        for (let i = 0; i < gate.inputsCount; i++) {
+            const pos = gate.getSocketPos('in', i);
+            
+            // CORREÇÃO: Verifica se há fio conectado olhando para AMBAS as pontas (to ou from)
+            const hasWire = wires.some(w => 
+                (w.to.gateId === gate.id && w.to.type === 'in' && w.to.index === i) ||
+                (w.from.gateId === gate.id && w.from.type === 'in' && w.from.index === i)
+            );
+            
+            // CORREÇÃO: Coleta o sinal elétrico real trafegando por qualquer fio conectado a este pino
+            let val = gate.manualInputs[i];
+            if (hasWire) {
+                const connectedWires = wires.filter(w => 
+                    (w.to.gateId === gate.id && w.to.type === 'in' && w.to.index === i) ||
+                    (w.from.gateId === gate.id && w.from.type === 'in' && w.from.index === i)
+                );
+                val = connectedWires.some(w => w.value);
+            }
+            
+            ctx.fillStyle = val ? '#00ffcc' : '#2a2a35'; 
+            ctx.strokeStyle = '#ffffff'; 
+            ctx.beginPath(); 
+            ctx.arc(pos.x, pos.y, 5 * gate.scale, 0, Math.PI * 2); 
+            ctx.fill(); 
+            ctx.stroke();
+            
+            if (!hasWire) { 
+                ctx.fillStyle = '#ffffff'; 
+                ctx.font = '9px sans-serif'; 
+                ctx.fillText(val ? "1" : "0", pos.x - 10, pos.y + 3); 
+            }
         }
+        // -------------------------------------------------------------------------
+
         
                         if (gate.type !== 'OUTPUT_LED' && gate.type !== 'BINARY_COUNTER' && gate.type !== 'HEX_DISPLAY' && gate.type !== 'DISPLAY_7SEG') {
             const outPos = gate.getSocketPos('out', 0); ctx.fillStyle = gate.outputValue ? '#00ffcc' : '#2a2a35'; ctx.strokeStyle = '#ffffff'; ctx.beginPath(); ctx.arc(outPos.x, outPos.y, 5 * gate.scale, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
