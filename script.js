@@ -576,9 +576,23 @@ function handlePointerStart(e) {
         return;
     }
 
-    if (!hit) {
+            if (!hit) {
         if (currentMode === 'wire' && activeWireStart) {
-            activeWirePoints.push({ x: wPos.x, y: wPos.y });
+            const srcGate = gates.find(g => g.id === activeWireStart.gateId);
+            if (srcGate) {
+                const pStart = srcGate.getSocketPos(activeWireStart.type, activeWireStart.index);
+                const lastPt = activeWirePoints.length > 0 ? activeWirePoints[activeWirePoints.length - 1] : pStart;
+                
+                const dx = Math.abs(wPos.x - lastPt.x);
+                const dy = Math.abs(wPos.y - lastPt.y);
+                
+                // Salva apenas um único ponto na direção predominante do clique
+                if (dx > dy) {
+                    activeWirePoints.push({ x: wPos.x, y: lastPt.y });
+                } else {
+                    activeWirePoints.push({ x: lastPt.x, y: wPos.y });
+                }
+            }
             return; 
         } else {
             isPanning = true;
@@ -587,6 +601,8 @@ function handlePointerStart(e) {
         }
         return;
     }
+
+
 
                 if (currentMode === 'select') {
         if (hit.type === 'gate') {
@@ -613,17 +629,47 @@ function handlePointerStart(e) {
             }
         }
     }
- else if (currentMode === 'wire' && hit.type === 'socket') {
+           else if (currentMode === 'wire' && hit.type === 'socket') {
         if (!activeWireStart) {
             activeWireStart = { gateId: hit.gateId, type: hit.socketType, index: hit.index };
             activeWirePoints = [];
         } else {
+            const srcGate = gates.find(g => g.id === activeWireStart.gateId);
+            const dstGate = gates.find(g => g.id === hit.gateId);
+            
+            if (srcGate && dstGate) {
+                const pStart = srcGate.getSocketPos(activeWireStart.type, activeWireStart.index);
+                const pEnd = dstGate.getSocketPos(hit.socketType, hit.index);
+                // Pega o último ponto clicado (ou o ponto inicial se não houver curvas intermediárias)
+                const lastPt = activeWirePoints.length > 0 ? activeWirePoints[activeWirePoints.length - 1] : pStart;
+                
+                // COMPENSAÇÃO ORTOGONAL: Se o pino de destino estiver na borda esquerda/direita (entradas/saídas normais),
+                // o fio deve chegar nele horizontalmente. Portanto, a quina deve ter o X do pino e o Y do ponto anterior.
+                // Caso contrário (como em displays ou componentes verticais), chega verticalmente.
+                if (hit.socketType === 'in' || hit.socketType === 'out') {
+                    // Só adiciona a quina de compensação se os pontos já não estiverem perfeitamente alinhados
+                    if (lastPt.x !== pEnd.x && lastPt.y !== pEnd.y) {
+                        activeWirePoints.push({ x: pEnd.x, y: lastPt.y });
+                    }
+                } else {
+                    if (lastPt.x !== pEnd.x && lastPt.y !== pEnd.y) {
+                        activeWirePoints.push({ x: lastPt.x, y: pEnd.y });
+                    }
+                }
+                
+                // Adiciona o ponto final exato do pino
+                activeWirePoints.push({ x: pEnd.x, y: pEnd.y });
+            }
+
             wires.push(new Wire({ ...activeWireStart }, { gateId: hit.gateId, type: hit.socketType, index: hit.index }, [...activeWirePoints]));
             activeWireStart = null;
             activeWirePoints = [];
             showToast("Fio Conectado!");
         }
-    } else if (currentMode === 'delete') {
+    }
+
+
+ else if (currentMode === 'delete') {
         if (hit.type === 'gate') {
             gates = gates.filter(g => g.id !== hit.gate.id);
             wires = wires.filter(w => w.from.gateId !== hit.gate.id && w.to.gateId !== hit.gate.id);
@@ -687,14 +733,37 @@ function render() {
         ctx.lineWidth = Math.max(1.5, 3 / Math.sqrt(transform.zoom)); ctx.strokeStyle = wire.value ? '#00ffcc' : '#444455'; ctx.stroke();
     });
 
-    if (currentMode === 'wire' && activeWireStart) {
+            if (currentMode === 'wire' && activeWireStart) {
         const srcGate = gates.find(g => g.id === activeWireStart.gateId);
         if (srcGate) {
             const pStart = srcGate.getSocketPos(activeWireStart.type, activeWireStart.index);
-            ctx.beginPath(); ctx.moveTo(pStart.x, pStart.y); activeWirePoints.forEach(pt => ctx.lineTo(pt.x, pt.y)); ctx.lineTo(currentMousePos.x, currentMousePos.y);
-            ctx.lineWidth = Math.max(1.0, 2 / Math.sqrt(transform.zoom)); ctx.strokeStyle = '#ff9800'; ctx.stroke();
+            
+            ctx.beginPath(); 
+            ctx.moveTo(pStart.x, pStart.y);
+            
+            // Desenha os pontos que você já fixou com cliques
+            activeWirePoints.forEach(pt => ctx.lineTo(pt.x, pt.y)); 
+            
+            const lastPt = activeWirePoints.length > 0 ? activeWirePoints[activeWirePoints.length - 1] : pStart;
+            
+            // Descobre qual distância é maior: horizontal (X) ou vertical (Y)
+            const dx = Math.abs(currentMousePos.x - lastPt.x);
+            const dy = Math.abs(currentMousePos.y - lastPt.y);
+            
+            // Trava rigidamente em apenas um eixo por vez (evita caminhos estranhos)
+            if (dx > dy) {
+                ctx.lineTo(currentMousePos.x, lastPt.y);
+            } else {
+                ctx.lineTo(lastPt.x, currentMousePos.y);
+            }
+            
+            ctx.lineWidth = Math.max(1.0, 2 / Math.sqrt(transform.zoom)); 
+            ctx.strokeStyle = '#ff9800'; 
+            ctx.stroke();
         }
     }
+
+
 
     gates.forEach(gate => {
         drawGateShape(ctx, gate);
