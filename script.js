@@ -108,14 +108,96 @@ class Gate {
 
 class Wire {
     constructor(from, to, points = []) {
-        this.from = from;
-        this.to = to;
-        this.points = points;
-        this.value = false;
+        this.from = from;         // { gateId, type: 'in'/'out', index }
+        this.to = to;             // { gateId, type: 'in'/'out', index }
+        this.points = points;     // Lista de nós intermediários [{x, y}, ...]
+        this.value = false;       // Estado lógico
+        this.selectedSegment = null; // Índice do segmento sendo arrastado atualmente
+    }
+
+    // Calcula dinamicamente os segmentos de reta (H ou V) formados pelos pontos
+    getSegments() {
+        const segments = [];
+        for (let i = 0; i < this.points.length - 1; i++) {
+            const p1 = this.points[i];
+            const p2 = this.points[i + 1];
+            segments.push({
+                x1: p1.x, y1: p1.y,
+                x2: p2.x, y2: p2.y,
+                isVertical: Math.abs(p1.x - p2.x) < 0.1
+            });
+        }
+        return segments;
     }
 }
+// // // =========================================================================
+// 2. MOTOR ORTOGONAL DINÂMICO - SIMÉTRICO E COM FOLGAS CONFORTÁVEIS NOS DOIS SENTIDOS
+// =========================================================================
+function generateSmartOrthogonalPath(pStart, pEnd, fromType) {
+    const points = [{ x: pStart.x, y: pStart.y }];
+    
+    const dx = pEnd.x - pStart.x;
+    const dy = pEnd.y - pStart.y;
 
-// Elementos iniciais da viewport (Nomes agora são calculados dinamicamente)
+    // Se estiverem praticamente alinhados em linha reta, conecta direto sem curvas bobas
+    if (Math.abs(dx) < 2) {
+        points.push({ x: pStart.x, y: pEnd.y });
+        return points;
+    }
+    if (Math.abs(dy) < 2) {
+        points.push({ x: pEnd.x, y: pStart.y });
+        return points;
+    }
+
+    const ESCAPE_DIST = 40; // Distância confortável de afastamento das portas lógicas
+
+    if (fromType === 'out') {
+        // CONEXÃO EXECUTADA DA ESQUERDA PARA A DIREITA
+        if (pStart.x < pEnd.x) {
+            // Avanço normal: Zigue-zague limpo pelo ponto médio (Z-Shape)
+            const midX = pStart.x + dx * 0.5;
+            points.push({ x: midX, y: pStart.y });
+            points.push({ x: midX, y: pEnd.y });
+        } else {
+            // Retorno em U (Fio contornando por trás): Afasta para a direita e faz a volta
+            const escapeX = pStart.x + ESCAPE_DIST; 
+            points.push({ x: escapeX, y: pStart.y });
+            points.push({ x: escapeX, y: pStart.y + dy * 0.5 });
+            points.push({ x: pEnd.x - ESCAPE_DIST, y: pStart.y + dy * 0.5 });
+            points.push({ x: pEnd.x - ESCAPE_DIST, y: pEnd.y });
+        }
+    } else {
+        // CONEXÃO EXECUTADA DA DIREITA PARA A ESQUERDA (Clique começou na Entrada)
+        if (pStart.x > pEnd.x) {
+            // Avanço normal para trás: Afasta primeiro para a esquerda (fuga do componente)
+            const escapeX = pStart.x - ESCAPE_DIST;
+            points.push({ x: escapeX, y: pStart.y });
+            points.push({ x: escapeX, y: pEnd.y });
+        } else {
+            // Retorno em U invertido: Afasta para a esquerda e faz o contorno confortável
+            const escapeX = pStart.x - ESCAPE_DIST;
+            points.push({ x: escapeX, y: pStart.y });
+            points.push({ x: escapeX, y: pStart.y + dy * 0.5 });
+            points.push({ x: pEnd.x + ESCAPE_DIST, y: pStart.y + dy * 0.5 });
+            points.push({ x: pEnd.x + ESCAPE_DIST, y: pEnd.y });
+        }
+    }
+
+    points.push({ x: pEnd.x, y: pEnd.y });
+
+    // Filtro de otimização: Limpa quinas duplicadas ou redundâncias
+    const optimizedPath = [];
+    optimizedPath.push(points[0]);
+    for (let i = 1; i < points.length; i++) {
+        const last = optimizedPath[optimizedPath.length - 1];
+        if (Math.hypot(last.x - points[i].x, last.y - points[i].y) > 0.5) {
+            optimizedPath.push(points[i]);
+        }
+    }
+    return optimizedPath;
+}
+
+// Elementos iniciais da viewport (Nome agora são calculados dinamicamente)
 gates.push(
     new Gate(1, 'AND', 220, 140),
     new Gate(4, 'INPUT_BTN', 60, 80),
@@ -629,44 +711,51 @@ function handlePointerStart(e) {
             }
         }
     }
-           else if (currentMode === 'wire' && hit.type === 'socket') {
+               // =========================================================================
+    // MODO FIAÇÃO ATUALIZADO COM TRAVA DE DUPLICIDADE (ANTI-AMBIGUIDADE)
+    // =========================================================================
+    else if (currentMode === 'wire' && hit.type === 'socket') {
         if (!activeWireStart) {
             activeWireStart = { gateId: hit.gateId, type: hit.socketType, index: hit.index };
             activeWirePoints = [];
         } else {
+            if (activeWireStart.gateId === hit.gateId && activeWireStart.type === hit.socketType && activeWireStart.index === hit.index) {
+                activeWireStart = null;
+                activeWirePoints = [];
+                return;
+            }
+
+            const isDuplicate = wires.some(w => {
+                const matchNormal = (w.from.gateId === activeWireStart.gateId && w.from.type === activeWireStart.type && w.from.index === activeWireStart.index &&
+                                     w.to.gateId === hit.gateId && w.to.type === hit.socketType && w.to.index === hit.index);
+                const matchInverted = (w.to.gateId === activeWireStart.gateId && w.to.type === activeWireStart.type && w.to.index === activeWireStart.index &&
+                                       w.from.gateId === hit.gateId && w.from.type === hit.socketType && w.from.index === hit.index);
+                return matchNormal || matchInverted;
+            });
+
+            if (isDuplicate) {
+                activeWireStart = null;
+                activeWirePoints = [];
+                if (typeof showToast === "function") showToast("Conexão já existente!");
+                return;
+            }
+
             const srcGate = gates.find(g => g.id === activeWireStart.gateId);
             const dstGate = gates.find(g => g.id === hit.gateId);
             
             if (srcGate && dstGate) {
                 const pStart = srcGate.getSocketPos(activeWireStart.type, activeWireStart.index);
                 const pEnd = dstGate.getSocketPos(hit.socketType, hit.index);
-                // Pega o último ponto clicado (ou o ponto inicial se não houver curvas intermediárias)
-                const lastPt = activeWirePoints.length > 0 ? activeWirePoints[activeWirePoints.length - 1] : pStart;
-                
-                // COMPENSAÇÃO ORTOGONAL: Se o pino de destino estiver na borda esquerda/direita (entradas/saídas normais),
-                // o fio deve chegar nele horizontalmente. Portanto, a quina deve ter o X do pino e o Y do ponto anterior.
-                // Caso contrário (como em displays ou componentes verticais), chega verticalmente.
-                if (hit.socketType === 'in' || hit.socketType === 'out') {
-                    // Só adiciona a quina de compensação se os pontos já não estiverem perfeitamente alinhados
-                    if (lastPt.x !== pEnd.x && lastPt.y !== pEnd.y) {
-                        activeWirePoints.push({ x: pEnd.x, y: lastPt.y });
-                    }
-                } else {
-                    if (lastPt.x !== pEnd.x && lastPt.y !== pEnd.y) {
-                        activeWirePoints.push({ x: lastPt.x, y: pEnd.y });
-                    }
-                }
-                
-                // Adiciona o ponto final exato do pino
-                activeWirePoints.push({ x: pEnd.x, y: pEnd.y });
+                activeWirePoints = generateSmartOrthogonalPath(pStart, pEnd, activeWireStart.type);
             }
 
             wires.push(new Wire({ ...activeWireStart }, { gateId: hit.gateId, type: hit.socketType, index: hit.index }, [...activeWirePoints]));
             activeWireStart = null;
             activeWirePoints = [];
-            showToast("Fio Conectado!");
+            if (typeof showToast === "function") showToast("Fio Conectado!");
         }
     }
+
 
 
  else if (currentMode === 'delete') {
@@ -725,44 +814,81 @@ function render() {
     // INTEGRAÇÃO: Garante o reajuste dinâmico das letras a cada novo frame de desenho
     updateInputLabels();
 
-    wires.forEach(wire => {
-        const gSrc = gates.find(g => g.id === wire.from.gateId), gDst = gates.find(g => g.id === wire.to.gateId);
+        // =========================================================================
+    // TRECHO ATUALIZADO DE FIAÇÃO DENTRO DO SEU RENDER()
+    // =========================================================================
+    
+    // 1. Desenho e Recálculo Automático dos Fios Conectados
+    wires.forEach((wire, wIdx) => {
+        const gSrc = gates.find(g => g.id === wire.from.gateId);
+        const gDst = gates.find(g => g.id === wire.to.gateId);
         if (!gSrc || !gDst) return;
-        const pStart = gSrc.getSocketPos(wire.from.type, wire.from.index), pEnd = gDst.getSocketPos(wire.to.type, wire.to.index);
-        ctx.beginPath(); ctx.moveTo(pStart.x, pStart.y); wire.points.forEach(pt => ctx.lineTo(pt.x, pt.y)); ctx.lineTo(pEnd.x, pEnd.y);
-        ctx.lineWidth = Math.max(1.5, 3 / Math.sqrt(transform.zoom)); ctx.strokeStyle = wire.value ? '#00ffcc' : '#444455'; ctx.stroke();
+
+        const pStart = gSrc.getSocketPos(wire.from.type, wire.from.index);
+        const pEnd = gDst.getSocketPos(wire.to.type, wire.to.index);
+
+        // SE O FIO NÃO ESTÁ SENDO ARRASTADO MANUALMENTE: Recalcula o trajeto ortogonal ideal fugindo das portas
+        if (wire.selectedSegment === null) {
+            wire.points = generateSmartOrthogonalPath(pStart, pEnd, wire.from.type, gSrc.id);
+        } else {
+            // Se estiver em edição manual, garante apenas que os extremos sigam cravados nos pinos
+            if (wire.points.length >= 2) {
+                wire.points[0].x = pStart.x;
+                wire.points[0].y = pStart.y;
+                wire.points[wire.points.length - 1].x = pEnd.x;
+                wire.points[wire.points.length - 1].y = pEnd.y;
+            }
+        }
+
+        // Desenha a trilha ortogonal
+        ctx.beginPath();
+        ctx.moveTo(wire.points[0].x, wire.points[0].y);
+        for (let i = 1; i < wire.points.length; i++) {
+            ctx.lineTo(wire.points[i].x, wire.points[i].y);
+        }
+        
+        ctx.lineWidth = Math.max(2, 4 / Math.sqrt(transform.zoom));
+        ctx.strokeStyle = wire.value ? '#00ffcc' : '#444455';
+        ctx.stroke();
+
+        // Se estiver no modo Config e o fio for o selecionado, destaca as quinas
+        if (currentMode === 'config' && selectedGate === wire) {
+            ctx.save();
+            ctx.lineWidth = Math.max(1, 2 / Math.sqrt(transform.zoom));
+            ctx.strokeStyle = '#00f0ff';
+            ctx.stroke();
+            
+            // Desenha os nós manipuladores nas dobras das esquinas
+            ctx.fillStyle = '#00f0ff';
+            for (let i = 1; i < wire.points.length - 1; i++) {
+                const pt = wire.points[i];
+                const size = 6 / transform.zoom;
+                ctx.fillRect(pt.x - size / 2, pt.y - size / 2, size, size);
+            }
+            ctx.restore();
+        }
     });
 
-            if (currentMode === 'wire' && activeWireStart) {
+    // 2. Pré-visualização inteligente do fio ortogonal em tempo de criação
+    if (currentMode === 'wire' && activeWireStart) {
         const srcGate = gates.find(g => g.id === activeWireStart.gateId);
         if (srcGate) {
             const pStart = srcGate.getSocketPos(activeWireStart.type, activeWireStart.index);
+            // Mostra em tempo real como o fio vai desviar dos blocos antes mesmo do clique final
+            const tempPoints = generateSmartOrthogonalPath(pStart, currentMousePos, activeWireStart.type, srcGate.id);
             
-            ctx.beginPath(); 
-            ctx.moveTo(pStart.x, pStart.y);
-            
-            // Desenha os pontos que você já fixou com cliques
-            activeWirePoints.forEach(pt => ctx.lineTo(pt.x, pt.y)); 
-            
-            const lastPt = activeWirePoints.length > 0 ? activeWirePoints[activeWirePoints.length - 1] : pStart;
-            
-            // Descobre qual distância é maior: horizontal (X) ou vertical (Y)
-            const dx = Math.abs(currentMousePos.x - lastPt.x);
-            const dy = Math.abs(currentMousePos.y - lastPt.y);
-            
-            // Trava rigidamente em apenas um eixo por vez (evita caminhos estranhos)
-            if (dx > dy) {
-                ctx.lineTo(currentMousePos.x, lastPt.y);
-            } else {
-                ctx.lineTo(lastPt.x, currentMousePos.y);
+            ctx.save();
+            ctx.beginPath();
+            ctx.moveTo(tempPoints[0].x, tempPoints[0].y);
+            for (let i = 1; i < tempPoints.length; i++) {
+                ctx.lineTo(tempPoints[i].x, tempPoints[i].y);
             }
-            
-            ctx.lineWidth = Math.max(1.0, 2 / Math.sqrt(transform.zoom)); 
-            ctx.strokeStyle = '#ff9800'; 
+            ctx.lineWidth = Math.max(1.5, 2 / Math.sqrt(transform.zoom));
+            ctx.strokeStyle = '#ff9800';
             ctx.stroke();
+            ctx.restore();
         }
     }
-
 
 
     gates.forEach(gate => {
