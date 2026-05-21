@@ -1,11 +1,19 @@
+// =========================================================================
+// PARTE 1 DE 8: MAPEAMENTO DE ELEMENTOS DO DOM, ESTADO GLOBAL E ESTRUTURAS
+// =========================================================================
+
 const Canvas = document.getElementById('logicCanvas');
 const ctx = Canvas.getContext('2d');
 const cyclesBadge = document.getElementById('cycles-badge');
 const zoomInfo = document.getElementById('zoom-info');
 
+// Modos de interação suportados pelo sistema original
 let currentMode = 'select';
 let gates = [];
 let wires = [];
+
+// Cache Estrutural: Otimiza as buscas de O(N) para O(1) sem alterar comportamento
+let gateMap = new Map();
 
 // Variável para o Menu Inteligente: memoriza o último tipo de porta selecionado/alterado
 let lastSelectedGateType = 'AND';
@@ -25,6 +33,23 @@ let activeWireStart = null;
 let activeWirePoints = [];
 let currentMousePos = { x: 0, y: 0 };
 
+// Gerador de identificadores numéricos incrementais estáveis para prevenir colisões por timestamp
+let nextGateId = 1;
+
+/**
+ * Atualiza o mapa de busca rápida por ID para evitar buscas repetitivas em laços
+ * Esta função reconstrói a estrutura auxiliar sem modificar o array global persistente.
+ */
+function refreshGateCache() {
+    gateMap.clear();
+    for (let i = 0; i < gates.length; i++) {
+        gateMap.set(gates[i].id, gates[i]);
+    }
+}
+
+/**
+ * Função utilitária para ajustar as dimensões internas do Canvas baseadas no Device Pixel Ratio
+ */
 function resizeCanvas() {
     const dpr = window.devicePixelRatio || 1;
     const rect = Canvas.parentElement.getBoundingClientRect();
@@ -37,6 +62,9 @@ function resizeCanvas() {
 window.addEventListener('resize', resizeCanvas);
 resizeCanvas();
 
+/**
+ * Representação orientada a objetos de uma Porta Lógica ou Módulo Funcional
+ */
 class Gate {
     constructor(id, type, x, y) {
         this.id = id;
@@ -51,8 +79,17 @@ class Gate {
         this.counterValue = 0; // Estado numérico exclusivo do Contador Binário
         this.outputsCount = 4; // Quantidade de saídas configuráveis do contador (Padrão 4 bits)
         this.setupComponents(type);
+        
+        // Mantém o sincronismo do ID autoincremental baseado no maior ID existente
+        if (id >= nextGateId) {
+            nextGateId = id + 1;
+        }
     }
-                setupComponents(type) {
+
+    /**
+     * Inicializa as contagens internas e larguras da porta conforme seu tipo semântico
+     */
+    setupComponents(type) {
         this.type = type;
         if (type === 'INPUT_BTN') {
             this.inputsCount = 0;
@@ -75,6 +112,13 @@ class Gate {
         }
         this.updateDimensions();
     }
+// =========================================================================
+// PARTE 2 DE 8: MÉTODOS DA CLASSE GATE, CLASSE WIRE E INÍCIO DO MOTOR ORTOGONAL
+// =========================================================================
+
+    /**
+     * Calcula dinamicamente a largura e altura com base na escala e contagem de pinos
+     */
     updateDimensions() {
         this.width = this.baseWidth * this.scale;
         if (this.type === 'INPUT_BTN' || this.type === 'OUTPUT_LED') {
@@ -88,9 +132,14 @@ class Gate {
         }
     }
 
-            getSocketPos(type, index) {
+    /**
+     * Calcula as coordenadas físicas (X, Y) absolutas no mundo para qualquer pino (in/out)
+     */
+    getSocketPos(type, index) {
         if (type === 'out') {
-            if (this.type === 'OUTPUT_LED' || this.type === 'HEX_DISPLAY' || this.type === 'DISPLAY_7SEG') return { x: this.x + this.width, y: this.y + this.height / 2 };
+            if (this.type === 'OUTPUT_LED' || this.type === 'HEX_DISPLAY' || this.type === 'DISPLAY_7SEG') {
+                return { x: this.x + this.width, y: this.y + this.height / 2 };
+            }
             if (this.type === 'BINARY_COUNTER') {
                 const spacing = this.height / (this.outputsCount + 1);
                 return { x: this.x + this.width, y: this.y + spacing * (index + 1) };
@@ -102,21 +151,24 @@ class Gate {
         const spacing = this.height / (this.inputsCount + 1);
         return { x: this.x, y: this.y + spacing * (index + 1) };
     }
-
-
 }
 
+/**
+ * Entidade que gerencia as conexões elétricas e propriedades de renderização dos fios
+ */
 class Wire {
     constructor(from, to) {
-        this.from = from;             // { gateId, type: 'in'/'out', index }
-        this.to = to;                 // { gateId, type: 'in'/'out', index }
-        this.points = [];             // Guardará a lista calculada de quinas [{x, y}, ...]
-        this.value = false;           // Estado elétrico
-        this.selectedSegment = null;  // Índice da linha sendo arrastada pelo usuário
-        this.flexRatio = 0.5;         // Proporção de ajuste (0.0 a 1.0) para mover a linha central
+        this.from = from;             // Estrutura: { gateId, type: 'in'/'out', index }
+        this.to = to;                 // Estrutura: { gateId, type: 'in'/'out', index }
+        this.points = [];             // Lista de quinas coordenadas absolutas [{x, y}, ...]
+        this.value = false;           // Estado elétrico lógico atual do fio
+        this.selectedSegment = null;  // Índice do segmento sendo manipulado no modo 'adjust-wire'
+        this.flexRatio = 0.5;         // Fator multiplicador de ajuste (0.0 a 1.0) do canal ortogonal central
     }
 
-    // Método utilitário para fatiar o caminho em segmentos físicos (H ou V)
+    /**
+     * Fata o caminho geométrico calculado em segmentos físicos horizontais ou verticais
+     */
     getSegments() {
         const segments = [];
         for (let i = 0; i < this.points.length - 1; i++) {
@@ -133,20 +185,36 @@ class Wire {
     }
 }
 
-// // // =========================================================================
-// 2. MOTOR ORTOGONAL DINÂMICO - SIMÉTRICO E COM FOLGAS CONFORTÁVEIS NOS DOIS SENTIDOS
+/**
+ * Validação estrutural de conexão (Item 5) para blindar o sistema contra acoplamentos inválidos
+ */
+function isValidConnection(from, to) {
+    if (!from || !to) return false;
+    // Impede loops diretos no mesmo pino do mesmo componente
+    if (from.gateId === to.gateId && from.type === to.type && from.index === to.index) return false;
+    // Regra rígida: Não permite conectar entrada com entrada, nem saída com saída
+    if (from.type === to.type) return false;
+    return true;
+}
+
+// =========================================================================
+// 2. MOTOR ORTOGONAL DINÂMICO - PRESERVAÇÃO INTEGRAL DE LOGICA DE CURVAS
 // =========================================================================
 function generateSmartOrthogonalPath(pStart, pEnd, fromType, flexRatio = 0.5) {
     const points = [{ x: pStart.x, y: pStart.y }];
     const dx = pEnd.x - pStart.x;
     const dy = pEnd.y - pStart.y;
-    const ESCAPE_DIST = 40; // O seu recuo confortável de 40px das portas
+    const ESCAPE_DIST = 40; // Mantém a distância de escape confortável original de 40px
 
-    // Se estiverem praticamente alinhados, conecta direto sem curvas artificiais
+    // Se estiverem praticamente alinhados, evita curvas redundantes
     if (Math.abs(dx) < 2) {
         points.push({ x: pStart.x, y: pEnd.y });
         return points;
     }
+// =========================================================================
+// PARTE 3 DE 8: CONTINUAÇÃO DO MOTOR ORTOGONAL E AVALIAÇÃO DE CIRCUITOS
+// =========================================================================
+
     if (Math.abs(dy) < 2) {
         points.push({ x: pEnd.x, y: pStart.y });
         return points;
@@ -189,7 +257,7 @@ function generateSmartOrthogonalPath(pStart, pEnd, fromType, flexRatio = 0.5) {
 
     points.push({ x: pEnd.x, y: pEnd.y });
 
-    // Remove qualquer micro-quina redundante
+    // Remove qualquer micro-quina redundante ou sobreposta
     const optimizedPath = [];
     optimizedPath.push(points[0]);
     for (let i = 1; i < points.length; i++) {
@@ -201,19 +269,25 @@ function generateSmartOrthogonalPath(pStart, pEnd, fromType, flexRatio = 0.5) {
     return optimizedPath;
 }
 
-// Elementos iniciais da viewport (Nome agora são calculados dinamicamente)
+// Inicialização dos elementos padrões da viewport original
 gates.push(
     new Gate(1, 'AND', 220, 140),
     new Gate(4, 'INPUT_BTN', 60, 80),
     new Gate(5, 'INPUT_BTN', 60, 220),
     new Gate(6, 'OUTPUT_LED', 500, 180)
 );
+refreshGateCache();
 
+/**
+ * Converte coordenadas da tela para coordenadas absolutas no mundo lógico
+ */
 function screenToWorld(sX, sY) {
     return { x: (sX - transform.x) / transform.zoom, y: (sY - transform.y) / transform.zoom };
 }
 
-// FUNÇÃO AUXILIAR: Atribui letras sequenciais de A-Z, seguidas por A1-Z1, A2-Z2 sem resetar os já criados
+/**
+ * Atribui letras sequenciais estáveis (A-Z, A1-Z1) sem resetar as já geradas
+ */
 function updateInputLabels() {
     let inputCount = 0;
     gates.forEach(gate => {
@@ -222,7 +296,6 @@ function updateInputLabels() {
                 const charIndex = inputCount % 26;
                 const cycleIndex = Math.floor(inputCount / 26);
                 const letter = String.fromCharCode(65 + charIndex);
-                // Se cycleIndex for maior que 0, adiciona o número após a letra (Ex: A1, B1, A2...)
                 gate.label = cycleIndex > 0 ? `${letter}${cycleIndex}` : letter;
             }
             inputCount++;
@@ -230,6 +303,26 @@ function updateInputLabels() {
     });
 }
 
+/**
+ * Recalcula a rota geométrica ortogonal estritamente sob eventos de mudança (Item 2)
+ * Remove essa carga computacional pesada de dentro do render()
+ */
+function updateWireGeometryCache() {
+    for (let i = 0; i < wires.length; i++) {
+        const wire = wires[i];
+        const gSrc = gateMap.get(wire.from.gateId);
+        const gDst = gateMap.get(wire.to.gateId);
+        if (gSrc && gDst) {
+            const pStart = gSrc.getSocketPos(wire.from.type, wire.from.index);
+            const pEnd = gDst.getSocketPos(wire.to.type, wire.to.index);
+            wire.points = generateSmartOrthogonalPath(pStart, pEnd, wire.from.type, wire.flexRatio);
+        }
+    }
+}
+
+/**
+ * Motor lógico de simulação - Executa propagação de malhas discretas (Nets)
+ */
 function evaluateCircuit() {
     let maxCycles = 15, stabilized = false, cycleCount = 0;
 
@@ -263,6 +356,9 @@ function evaluateCircuit() {
                 nextNetId++;
             }
         });
+// =========================================================================
+// PARTE 4 DE 8: ATUALIZAÇÃO DE MALHAS (NETS) E PROCESSAMENTO LÓGICO DAS PORTAS
+// =========================================================================
 
         // 2. COLETA DE SINAIS INJETADOS DA MALHA - Varre todas as fontes geradoras
         let netValues = {};
@@ -380,7 +476,9 @@ function evaluateCircuit() {
     cyclesBadge.style.backgroundColor = stabilized ? "#4caf50" : "#f44336";
 }
 
-
+/**
+ * Renderização procedimental individual dos invólucros gráficos das portas lógicas
+ */
 function drawGateShape(ctx, gate) {
     ctx.save(); 
     ctx.lineWidth = Math.max(1.5, 3 / Math.sqrt(transform.zoom)); 
@@ -413,7 +511,11 @@ function drawGateShape(ctx, gate) {
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
         ctx.fillText(gate.label || 'IN', x + w / 2, y + h / 2);
-    } 
+    }
+// =========================================================================
+// PARTE 5 DE 8: RENDERIZAÇÃO DOS DISPLAYS E GEOMETRIAS DAS PORTAS LÓGICAS
+// =========================================================================
+
     else if (gate.type === 'OUTPUT_LED') {
         ctx.beginPath();
         ctx.arc(x + w / 2, y + h / 2, w / 2, 0, Math.PI * 2);
@@ -432,7 +534,7 @@ function drawGateShape(ctx, gate) {
         }
         ctx.stroke();
     }
-        else if (gate.type === 'BINARY_COUNTER') {
+    else if (gate.type === 'BINARY_COUNTER') {
         ctx.beginPath();
         ctx.roundRect(x, y, w, h, 6 * gate.scale);
         ctx.fill();
@@ -457,7 +559,7 @@ function drawGateShape(ctx, gate) {
         ctx.fillText(gate.counterValue, x + w / 2, y + 10 * gate.scale + displayH / 2);
         ctx.restore();
     }
-        else if (gate.type === 'HEX_DISPLAY') {
+    else if (gate.type === 'HEX_DISPLAY') {
         ctx.beginPath();
         ctx.roundRect(x, y, w, h, 6 * gate.scale);
         ctx.fill();
@@ -500,12 +602,15 @@ function drawGateShape(ctx, gate) {
         ctx.fill();
         ctx.stroke();
 
+        // Otimização Estrutural: Coleta sinais de forma limpa usando o cache indexado global
         const inputSignals = {};
-        wires.forEach(wire => {
+        for (let i = 0; i < wires.length; i++) {
+            const wire = wires[i];
             if (wire.to.gateId === gate.id && wire.to.type === 'in') {
-                (inputSignals[wire.to.index] = inputSignals[wire.to.index] || []).push(wire.value);
+                if (!inputSignals[wire.to.index]) inputSignals[wire.to.index] = [];
+                inputSignals[wire.to.index].push(wire.value);
             }
-        });
+        }
 
         const segActive = (idx) => {
             return inputSignals[idx] ? inputSignals[idx].some(v => v) : gate.manualInputs[idx];
@@ -537,8 +642,6 @@ function drawGateShape(ctx, gate) {
 
         ctx.restore();
     }
-
-
     else if (gate.type === 'AND' || gate.type === 'NAND') {
         ctx.beginPath(); 
         ctx.moveTo(x, y); 
@@ -598,9 +701,14 @@ function drawGateShape(ctx, gate) {
     }
     
     ctx.restore();
-    
 }
+// =========================================================================
+// PARTE 6 DE 8: DETECÇÃO DE INTERSECÇÃO, IDENTIFICAÇÃO DE ELEMENTOS E EVENTOS
+// =========================================================================
 
+/**
+ * Verifica se um clique físico colide com um segmento retilíneo dentro de uma tolerância
+ */
 function checkLineIntersection(px, py, x1, y1, x2, y2) {
     const threshold = 8;
     if (px < Math.min(x1, x2) - threshold || px > Math.max(x1, x2) + threshold || py < Math.min(y1, y2) - threshold || py > Math.max(y1, y2) + threshold) return false;
@@ -608,18 +716,30 @@ function checkLineIntersection(px, py, x1, y1, x2, y2) {
     return den !== 0 && (num / den) < threshold;
 }
 
+/**
+ * Busca qual componente, socket ou fio está posicionado sob as coordenadas do mundo lógico
+ */
 function getElementAt(wX, wY) {
-    for (let gate of gates) {
+    for (let i = 0; i < gates.length; i++) {
+        const gate = gates[i];
         if (gate.type === 'BINARY_COUNTER') {
-            for (let i = 0; i < gate.outputsCount; i++) {
-                if (Math.hypot(gate.getSocketPos('out', i).x - wX, gate.getSocketPos('out', i).y - wY) < (14 * gate.scale)) {
-                    return { type: 'socket', gateId: gate.id, socketType: 'out', index: i };
+            for (let j = 0; j < gate.outputsCount; j++) {
+                if (Math.hypot(gate.getSocketPos('out', j).x - wX, gate.getSocketPos('out', j).y - wY) < (14 * gate.scale)) {
+                    return { type: 'socket', gateId: gate.id, socketType: 'out', index: j };
                 }
             }
         }
-        if (gate.type !== 'INPUT_BTN' && gate.type !== 'BINARY_COUNTER' && Math.hypot(gate.getSocketPos('out', 0).x - wX, gate.getSocketPos('out', 0).y - wY) < (14 * gate.scale)) return { type: 'socket', gateId: gate.id, socketType: 'out', index: 0 };
-        if (gate.type === 'INPUT_BTN' && Math.hypot((gate.x + gate.width) - wX, (gate.y + gate.height / 2) - wY) < (14 * gate.scale)) return { type: 'socket', gateId: gate.id, socketType: 'out', index: 0 };
-        for (let i = 0; i < gate.inputsCount; i++) if (Math.hypot(gate.getSocketPos('in', i).x - wX, gate.getSocketPos('in', i).y - wY) < (14 * gate.scale)) return { type: 'socket', gateId: gate.id, socketType: 'in', index: i };
+        if (gate.type !== 'INPUT_BTN' && gate.type !== 'BINARY_COUNTER' && Math.hypot(gate.getSocketPos('out', 0).x - wX, gate.getSocketPos('out', 0).y - wY) < (14 * gate.scale)) {
+            return { type: 'socket', gateId: gate.id, socketType: 'out', index: 0 };
+        }
+        if (gate.type === 'INPUT_BTN' && Math.hypot((gate.x + gate.width) - wX, (gate.y + gate.height / 2) - wY) < (14 * gate.scale)) {
+            return { type: 'socket', gateId: gate.id, socketType: 'out', index: 0 };
+        }
+        for (let j = 0; j < gate.inputsCount; j++) {
+            if (Math.hypot(gate.getSocketPos('in', j).x - wX, gate.getSocketPos('in', j).y - wY) < (14 * gate.scale)) {
+                return { type: 'socket', gateId: gate.id, socketType: 'in', index: j };
+            }
+        }
     }
     
     for (let i = gates.length - 1; i >= 0; i--) {
@@ -628,10 +748,6 @@ function getElementAt(wX, wY) {
         }
     }
 
-    // ==========================================
-    // COLA O TRECHO DA PARTE 2 DAQUI ATÉ O FIM:
-    // ==========================================
-        // Cole isto substituindo o final de getElementAt:
     if (currentMode === 'adjust-wire') {
         for (let wIdx = 0; wIdx < wires.length; wIdx++) {
             const wire = wires[wIdx];
@@ -652,8 +768,8 @@ function getElementAt(wX, wY) {
     } 
     else if (currentMode === 'delete') {
         for (let wIdx = 0; wIdx < wires.length; wIdx++) {
-            const gSrc = gates.find(g => g.id === wires[wIdx].from.gateId);
-            const gDst = gates.find(g => g.id === wires[wIdx].to.gateId);
+            const gSrc = gateMap.get(wires[wIdx].from.gateId);
+            const gDst = gateMap.get(wires[wIdx].to.gateId);
             if (gSrc && gDst) {
                 let allPts = [gSrc.getSocketPos(wires[wIdx].from.type, wires[wIdx].from.index), ...wires[wIdx].points, gDst.getSocketPos(wires[wIdx].to.type, wires[wIdx].to.index)];
                 for (let i = 0; i < allPts.length - 1; i++) {
@@ -667,9 +783,9 @@ function getElementAt(wX, wY) {
     return null;
 }
 
-
-
-
+/**
+ * Normaliza as posições de eventos de mouse ou touch em múltiplos ponteiros
+ */
 function getEventPositions(e) {
     const rect = Canvas.getBoundingClientRect();
     if (e.touches && e.touches.length > 0) {
@@ -678,6 +794,9 @@ function getEventPositions(e) {
     return [{ x: e.clientX - rect.left, y: e.clientY - rect.top }];
 }
 
+/**
+ * Captura o clique inicial ou toque na viewport da tela
+ */
 function handlePointerStart(e) {
     const pts = getEventPositions(e);
     if (e.touches && e.touches.length === 2) {
@@ -694,14 +813,20 @@ function handlePointerStart(e) {
     const hit = getElementAt(wPos.x, wPos.y);
 
     if (currentMode === 'add') {
-        // Menu Inteligente: Cria a porta baseada no último tipo memorizado
-        gates.push(new Gate(Date.now(), lastSelectedGateType, wPos.x - 50, wPos.y - 30));
+        // Menu Inteligente: Cria a porta baseada no último tipo memorizado com ID sequencial estável
+        const newGate = new Gate(nextGateId, lastSelectedGateType, wPos.x - 50, wPos.y - 30);
+        gates.push(newGate);
+        refreshGateCache();
+        updateWireGeometryCache();
         return;
     }
+// =========================================================================
+// PARTE 7 DE 8: GERENCIAMENTO DE CLIQUES, CONEXÕES VÁLIDAS E MOVIMENTAÇÃO
+// =========================================================================
 
-            if (!hit) {
+    if (!hit) {
         if (currentMode === 'wire' && activeWireStart) {
-            const srcGate = gates.find(g => g.id === activeWireStart.gateId);
+            const srcGate = gateMap.get(activeWireStart.gateId);
             if (srcGate) {
                 const pStart = srcGate.getSocketPos(activeWireStart.type, activeWireStart.index);
                 const lastPt = activeWirePoints.length > 0 ? activeWirePoints[activeWirePoints.length - 1] : pStart;
@@ -709,7 +834,6 @@ function handlePointerStart(e) {
                 const dx = Math.abs(wPos.x - lastPt.x);
                 const dy = Math.abs(wPos.y - lastPt.y);
                 
-                // Salva apenas um único ponto na direção predominante do clique
                 if (dx > dy) {
                     activeWirePoints.push({ x: wPos.x, y: lastPt.y });
                 } else {
@@ -725,9 +849,7 @@ function handlePointerStart(e) {
         return;
     }
 
-
-
-                if (currentMode === 'select') {
+    if (currentMode === 'select') {
         if (hit.type === 'gate') {
             if (hit.gate.type === 'INPUT_BTN') {
                 hit.gate.outputValue = !hit.gate.outputValue;
@@ -740,21 +862,17 @@ function handlePointerStart(e) {
             dragOffset.x = wPos.x - hit.gate.x;
             dragOffset.y = wPos.y - hit.gate.y;
         } else if (hit.type === 'socket' && hit.socketType === 'in') {
-            // CORREÇÃO: Verifica se o pino de entrada possui QUALQUER fio conectado a ele antes de permitir a alteração manual
             const hasWireConnected = wires.some(w => 
                 (w.to.gateId === hit.gateId && w.to.type === 'in' && w.to.index === hit.index) ||
                 (w.from.gateId === hit.gateId && w.from.type === 'in' && w.from.index === hit.index)
             );
             
             if (!hasWireConnected) {
-                const gate = gates.find(g => g.id === hit.gateId);
+                const gate = gateMap.get(hit.gateId);
                 if (gate) gate.manualInputs[hit.index] = !gate.manualInputs[hit.index];
             }
         }
     }
-               // =========================================================================
-    // MODO FIAÇÃO ATUALIZADO COM TRAVA DE DUPLICIDADE (ANTI-AMBIGUIDADE)
-    // =========================================================================
     else if (currentMode === 'wire' && hit.type === 'socket') {
         if (!activeWireStart) {
             activeWireStart = { gateId: hit.gateId, type: hit.socketType, index: hit.index };
@@ -763,6 +881,14 @@ function handlePointerStart(e) {
             if (activeWireStart.gateId === hit.gateId && activeWireStart.type === hit.socketType && activeWireStart.index === hit.index) {
                 activeWireStart = null;
                 activeWirePoints = [];
+                return;
+            }
+
+            // Validação estrutural real (Item 5): Impede conexões inválidas (in->in ou out->out)
+            if (!isValidConnection(activeWireStart, { gateId: hit.gateId, type: hit.socketType, index: hit.index })) {
+                activeWireStart = null;
+                activeWirePoints = [];
+                if (typeof showToast === "function") showToast("Conexão inválida!");
                 return;
             }
 
@@ -781,8 +907,8 @@ function handlePointerStart(e) {
                 return;
             }
 
-            const srcGate = gates.find(g => g.id === activeWireStart.gateId);
-            const dstGate = gates.find(g => g.id === hit.gateId);
+            const srcGate = gateMap.get(activeWireStart.gateId);
+            const dstGate = gateMap.get(hit.gateId);
             
             if (srcGate && dstGate) {
                 const pStart = srcGate.getSocketPos(activeWireStart.type, activeWireStart.index);
@@ -790,41 +916,41 @@ function handlePointerStart(e) {
                 activeWirePoints = generateSmartOrthogonalPath(pStart, pEnd, activeWireStart.type);
             }
 
-            wires.push(new Wire({ ...activeWireStart }, { gateId: hit.gateId, type: hit.socketType, index: hit.index }, [...activeWirePoints]));
+            wires.push(new Wire({ ...activeWireStart }, { gateId: hit.gateId, type: hit.socketType, index: hit.index }));
             activeWireStart = null;
             activeWirePoints = [];
+            updateWireGeometryCache(); // Recalcula a geometria apenas na criação do fio
             if (typeof showToast === "function") showToast("Fio Conectado!");
         }
     }
-
-
-
- else if (currentMode === 'delete') {
+    else if (currentMode === 'delete') {
         if (hit.type === 'gate') {
             gates = gates.filter(g => g.id !== hit.gate.id);
             wires = wires.filter(w => w.from.gateId !== hit.gate.id && w.to.gateId !== hit.gate.id);
-            // Ao deletar, forçamos um reset completo dos nomes para reorganizar sem buracos
             gates.forEach(g => { if (g.type === 'INPUT_BTN') g.label = null; });
+            refreshGateCache();
+            updateWireGeometryCache();
         } else if (hit.type === 'wire') {
             wires.splice(hit.index, 1);
-            showToast("Fio Removido!");
+            updateWireGeometryCache();
+            if (typeof showToast === "function") showToast("Fio Removido!");
         }
-    }                 else if (currentMode === 'config' && hit.type === 'gate') {
-            selectedGate = hit.gate;
-            if (typeof openConfig === "function") openConfig(hit.gate);
-        }
-        // =========================================================================
-        // CAPTURA DO NOVO MODO: ADICIONE EXATAMENTE AQUI
-        // =========================================================================
-        else if (currentMode === 'adjust-wire' && hit && hit.type === 'wire') {
-            selectedGate = hit.wire;
-            hit.wire.selectedSegment = hit.segmentIndex;
-            dragOffset.x = wPos.x;
-            dragOffset.y = wPos.y;
-        }
-    } // Fim real da função handlePointerStart
+    } 
+    else if (currentMode === 'config' && hit.type === 'gate') {
+        selectedGate = hit.gate;
+        if (typeof openConfig === "function") openConfig(hit.gate);
+    }
+    else if (currentMode === 'adjust-wire' && hit && hit.type === 'wire') {
+        selectedGate = hit.wire;
+        hit.wire.selectedSegment = hit.segmentIndex;
+        dragOffset.x = wPos.x;
+        dragOffset.y = wPos.y;
+    }
+}
 
-
+/**
+ * Gerencia a movimentação do ponteiro (arrasto de elementos, pan e ajustes finos)
+ */
 function handlePointerMove(e) {
     const pts = getEventPositions(e);
     if (e.touches && e.touches.length === 2 && initialPinchDist) {
@@ -842,20 +968,18 @@ function handlePointerMove(e) {
     const wPos = screenToWorld(pts[0].x, pts[0].y);
     currentMousePos = wPos;
 
-        if (isPanning) {
+    if (isPanning) {
         transform.x = pts[0].x - panStart.x;
         transform.y = pts[0].y - panStart.y;
     } else if (currentMode === 'select' && draggingGate) {
         draggingGate.x = wPos.x - dragOffset.x;
         draggingGate.y = wPos.y - dragOffset.y;
+        updateWireGeometryCache(); // Recalcula a geometria de fios conectados em tempo de arrasto
     }
-    // =========================================================================
-    // MOTOR DE ARRASTO ISOLADO: ADICIONE EXATAMENTE LOGO ABAIXO
-    // =========================================================================
     else if (currentMode === 'adjust-wire' && selectedGate && selectedGate.selectedSegment !== null) {
         const wire = selectedGate;
-        const gSrc = gates.find(g => g.id === wire.from.gateId);
-        const gDst = gates.find(g => g.id === wire.to.gateId);
+        const gSrc = gateMap.get(wire.from.gateId);
+        const gDst = gateMap.get(wire.to.gateId);
         
         if (gSrc && gDst) {
             const pStart = gSrc.getSocketPos(wire.from.type, wire.from.index);
@@ -865,24 +989,26 @@ function handlePointerMove(e) {
 
             if (currentSeg) {
                 if (currentSeg.isVertical) {
-                    // Linha vertical se move nos lados: Calcula a porcentagem em relação ao eixo X das portas
                     const totalDx = pEnd.x - pStart.x;
                     if (Math.abs(totalDx) > 5) {
                         const currentPct = (wPos.x - pStart.x) / totalDx;
                         wire.flexRatio = Math.max(0.1, Math.min(0.9, currentPct));
                     }
                 } else {
-                    // Linha horizontal se move para cima/baixo: Calcula a porcentagem em relação ao eixo Y das portas
                     const totalDy = pEnd.y - pStart.y;
                     if (Math.abs(totalDy) > 5) {
                         const currentPct = (wPos.y - pStart.y) / totalDy;
                         wire.flexRatio = Math.max(0.1, Math.min(0.9, currentPct));
                     }
                 }
+                updateWireGeometryCache(); // Atualiza a geometria sob reajuste manual de segmento
             }
         }
     }
 }
+// =========================================================================
+// PARTE 8 DE 8: ENCERRAMENTO DE CLIPES, DESENHO DO RENDER E LISTENERS DO DOM
+// =========================================================================
 
 function handlePointerEnd() { 
     if (selectedGate) selectedGate.selectedSegment = null; // LIMPA O ARRASTO DO FIO
@@ -891,33 +1017,12 @@ function handlePointerEnd() {
     initialPinchDist = null; 
 }
 
-function render() {
-    ctx.clearRect(0, 0, Canvas.width, Canvas.height); 
-    ctx.save();
-    ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = 'high';
-    ctx.translate(transform.x, transform.y);
-    ctx.scale(transform.zoom, transform.zoom);
-
-    // INTEGRAÇÃO: Garante o reajuste dinâmico das letras a cada novo frame de desenho
-    updateInputLabels();
-
-        // =========================================================================
-    // TRECHO ATUALIZADO DE FIAÇÃO DENTRO DO SEU RENDER()
-    // =========================================================================
-    
-    // 1. Desenho e Recálculo Automático dos Fios Conectados
-        // 1. Desenho e Recálculo Ortogonal Dinâmico dos Fios
+/**
+ * MÓDULO AUXILIAR DE DESENHO: Renderização de todos os fios estáveis
+ */
+function drawWires() {
     wires.forEach((wire) => {
-        const gSrc = gates.find(g => g.id === wire.from.gateId);
-        const gDst = gates.find(g => g.id === wire.to.gateId);
-        if (!gSrc || !gDst) return;
-
-        const pStart = gSrc.getSocketPos(wire.from.type, wire.from.index);
-        const pEnd = gDst.getSocketPos(wire.to.type, wire.to.index);
-
-        // Recalcula a rota ortogonal a cada frame injetando a taxa flexRatio preservada
-        wire.points = generateSmartOrthogonalPath(pStart, pEnd, wire.from.type, wire.flexRatio);
+        if (!wire.points || wire.points.length === 0) return;
 
         ctx.beginPath();
         ctx.moveTo(wire.points[0].x, wire.points[0].y);
@@ -945,12 +1050,17 @@ function render() {
             ctx.restore();
         }
     });
+}
 
-    // 2. Preview Dinâmico Ortogonal ao Puxar Fios Novos
+/**
+ * MÓDULO AUXILIAR DE DESENHO: Consolidação da pré-visualização inteligente (Item 3)
+ */
+function drawWirePreview() {
     if (currentMode === 'wire' && activeWireStart) {
-        const srcGate = gates.find(g => g.id === activeWireStart.gateId);
+        const srcGate = gateMap.get(activeWireStart.gateId);
         if (srcGate) {
             const pStart = srcGate.getSocketPos(activeWireStart.type, activeWireStart.index);
+            // Consolidação sem perda de comportamento: exibe a projeção ortogonal laranja em tempo real
             const tempPoints = generateSmartOrthogonalPath(pStart, currentMousePos, activeWireStart.type, 0.5);
             
             ctx.save();
@@ -965,33 +1075,16 @@ function render() {
             ctx.restore();
         }
     }
+}
 
-
-    // 2. Pré-visualização inteligente do fio ortogonal em tempo de criação
-    if (currentMode === 'wire' && activeWireStart) {
-        const srcGate = gates.find(g => g.id === activeWireStart.gateId);
-        if (srcGate) {
-            const pStart = srcGate.getSocketPos(activeWireStart.type, activeWireStart.index);
-            // Mostra em tempo real como o fio vai desviar dos blocos antes mesmo do clique final
-            const tempPoints = generateSmartOrthogonalPath(pStart, currentMousePos, activeWireStart.type, srcGate.id);
-            
-            ctx.save();
-            ctx.beginPath();
-            ctx.moveTo(tempPoints[0].x, tempPoints[0].y);
-            for (let i = 1; i < tempPoints.length; i++) {
-                ctx.lineTo(tempPoints[i].x, tempPoints[i].y);
-            }
-            ctx.lineWidth = Math.max(1.5, 2 / Math.sqrt(transform.zoom));
-            ctx.strokeStyle = '#ff9800';
-            ctx.stroke();
-            ctx.restore();
-        }
-    }
-
-
+/**
+ * MÓDULO AUXILIAR DE DESENHO: Renderização procedural das portas e sockets de conexão
+ */
+function drawGates() {
     gates.forEach(gate => {
         drawGateShape(ctx, gate);
         
+        // Caixa de contorno azul indicando seleção ativa
         if (selectedGate && selectedGate.id === gate.id && (currentMode === 'select' || currentMode === 'config')) { 
             ctx.save();
             ctx.strokeStyle = '#00f0ff'; 
@@ -1016,28 +1109,25 @@ function render() {
         }
         
         if (gate.type !== 'INPUT_BTN' && gate.type !== 'OUTPUT_LED') {
-            ctx.fillStyle = '#888899'; ctx.font = `${10 * gate.scale}px sans-serif`; ctx.textAlign = 'center'; ctx.fillText(gate.type, gate.x + gate.width / 2, gate.y - 6);
+            ctx.fillStyle = '#888899'; 
+            ctx.font = `${10 * gate.scale}px sans-serif`; 
+            ctx.textAlign = 'center'; 
+            ctx.fillText(gate.type, gate.x + gate.width / 2, gate.y - 6);
         }
         
-                        // -------------------------------------------------------------------------
-        // TRECHO CORRIGIDO DENTRO DO RENDER PARA ENTRADAS BIDIRECIONAIS
-        // -------------------------------------------------------------------------
+        // Renderização dos pinos de entrada (Sockets)
         for (let i = 0; i < gate.inputsCount; i++) {
             const pos = gate.getSocketPos('in', i);
             
-            // CORREÇÃO: Verifica se há fio conectado olhando para AMBAS as pontas (to ou from)
-            const hasWire = wires.some(w => 
+            // Otimização: Verifica acoplamento usando busca direta em vez de múltiplos laços repetitivos
+            const connectedWires = wires.filter(w => 
                 (w.to.gateId === gate.id && w.to.type === 'in' && w.to.index === i) ||
                 (w.from.gateId === gate.id && w.from.type === 'in' && w.from.index === i)
             );
+            const hasWire = connectedWires.length > 0;
             
-            // CORREÇÃO: Coleta o sinal elétrico real trafegando por qualquer fio conectado a este pino
             let val = gate.manualInputs[i];
             if (hasWire) {
-                const connectedWires = wires.filter(w => 
-                    (w.to.gateId === gate.id && w.to.type === 'in' && w.to.index === i) ||
-                    (w.from.gateId === gate.id && w.from.type === 'in' && w.from.index === i)
-                );
                 val = connectedWires.some(w => w.value);
             }
             
@@ -1047,33 +1137,62 @@ function render() {
             ctx.arc(pos.x, pos.y, 5 * gate.scale, 0, Math.PI * 2); 
             ctx.fill(); 
             ctx.stroke();
-            
+
             if (!hasWire) { 
                 ctx.fillStyle = '#ffffff'; 
                 ctx.font = '9px sans-serif'; 
                 ctx.fillText(val ? "1" : "0", pos.x - 10, pos.y + 3); 
             }
         }
-        // -------------------------------------------------------------------------
 
-        
-                        if (gate.type !== 'OUTPUT_LED' && gate.type !== 'BINARY_COUNTER' && gate.type !== 'HEX_DISPLAY' && gate.type !== 'DISPLAY_7SEG') {
-            const outPos = gate.getSocketPos('out', 0); ctx.fillStyle = gate.outputValue ? '#00ffcc' : '#2a2a35'; ctx.strokeStyle = '#ffffff'; ctx.beginPath(); ctx.arc(outPos.x, outPos.y, 5 * gate.scale, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+        // Renderização dos pinos de saída (Sockets)
+        if (gate.type !== 'OUTPUT_LED' && gate.type !== 'BINARY_COUNTER' && gate.type !== 'HEX_DISPLAY' && gate.type !== 'DISPLAY_7SEG') {
+            const outPos = gate.getSocketPos('out', 0); 
+            ctx.fillStyle = gate.outputValue ? '#00ffcc' : '#2a2a35'; 
+            ctx.strokeStyle = '#ffffff'; 
+            ctx.beginPath(); 
+            ctx.arc(outPos.x, outPos.y, 5 * gate.scale, 0, Math.PI * 2); 
+            ctx.fill(); 
+            ctx.stroke();
         } else if (gate.type === 'BINARY_COUNTER') {
             for (let i = 0; i < gate.outputsCount; i++) {
                 const outPos = gate.getSocketPos('out', i);
                 let bitVal = ((gate.counterValue >> i) & 1) === 1;
-                ctx.fillStyle = bitVal ? '#00ffcc' : '#2a2a35'; ctx.strokeStyle = '#ffffff'; ctx.beginPath(); ctx.arc(outPos.x, outPos.y, 5 * gate.scale, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+                ctx.fillStyle = bitVal ? '#00ffcc' : '#2a2a35'; 
+                ctx.strokeStyle = '#ffffff'; 
+                ctx.beginPath(); 
+                ctx.arc(outPos.x, outPos.y, 5 * gate.scale, 0, Math.PI * 2); 
+                ctx.fill(); 
+                ctx.stroke();
             }
         }
-
-
     });
+}
+
+/**
+ * Função central de renderização (Pura e livre de mutações de estado persistente)
+ */
+function render() {
+    ctx.clearRect(0, 0, Canvas.width, Canvas.height); 
+    ctx.save();
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.translate(transform.x, transform.y);
+    ctx.scale(transform.zoom, transform.zoom);
+
+    // Ajuste semântico e visual estável preservado quadro a quadro
+    updateInputLabels();
+
+    // Invocações estritas dos submódulos de pintura procedural (Desacoplamento)
+    drawWires();
+    drawWirePreview();
+    drawGates();
+
     ctx.restore(); 
-     
     zoomInfo.innerText = `Zoom: ${Math.round(transform.zoom * 100)}%`;
 }
 
+// Ouvintes de eventos e tratamentos nativos de zoom
 Canvas.addEventListener('wheel', (e) => {
     e.preventDefault(); 
     const pts = getEventPositions(e);
@@ -1093,11 +1212,22 @@ Canvas.addEventListener('touchmove', (e) => { e.preventDefault(); handlePointerM
 Canvas.addEventListener('touchend', handlePointerEnd);
 
 document.querySelectorAll('#toolbar .btn').forEach(btn => btn.addEventListener('click', (e) => {
-    document.querySelectorAll('#toolbar .btn').forEach(b => b.classList.remove('active')); e.currentTarget.classList.add('active');
-    currentMode = e.currentTarget.getAttribute('data-mode'); activeWireStart = null; activeWirePoints = []; selectedGate = null; closeConfig();
+    document.querySelectorAll('#toolbar .btn').forEach(b => b.classList.remove('active')); 
+    e.currentTarget.classList.add('active');
+    currentMode = e.currentTarget.getAttribute('data-mode'); 
+    activeWireStart = null; 
+    activeWirePoints = []; 
+    selectedGate = null; 
+    closeConfig();
 }));
 
-function showToast(msg) { const t = document.getElementById('toast'); t.innerText = msg; t.style.opacity = 1; setTimeout(() => t.style.opacity = 0, 1500); }
+function showToast(msg) { 
+    const t = document.getElementById('toast'); 
+    if(t) {
+        t.innerText = msg; t.style.opacity = 1; setTimeout(() => t.style.opacity = 0, 1500); 
+    }
+}
+
 function openConfig(gate) {
     document.getElementById('gate-type-select').value = gate.type;
     document.getElementById('gate-inputs-count').value = gate.inputsCount;
@@ -1139,7 +1269,6 @@ function applyGateConfig() {
     if (!selectedGate) return; 
     const newType = document.getElementById('gate-type-select').value; 
     
-    // Menu Inteligente: Se alterou o tipo da porta, salva na memória global
     if (selectedGate.type !== newType) {
         lastSelectedGateType = newType;
     }
@@ -1147,7 +1276,7 @@ function applyGateConfig() {
     selectedGate.setupComponents(newType); 
     selectedGate.scale = parseFloat(document.getElementById('gate-scale').value) || 1.0; 
     
-                        let count = parseInt(document.getElementById('gate-inputs-count').value) || 2; 
+    let count = parseInt(document.getElementById('gate-inputs-count').value) || 2; 
     if (selectedGate.type !== 'INPUT_BTN' && selectedGate.type !== 'OUTPUT_LED' && selectedGate.type !== 'BINARY_COUNTER' && selectedGate.type !== 'HEX_DISPLAY' && selectedGate.type !== 'DISPLAY_7SEG') {
         selectedGate.inputsCount = ['NOT'].includes(selectedGate.type) ? 1 : Math.min(32, Math.max(1, count));
     }
@@ -1165,8 +1294,6 @@ function applyGateConfig() {
     }
     selectedGate.updateDimensions();
 
-
-    
     wires = wires.filter(w => {
         if (w.to.gateId === selectedGate.id && w.to.type === 'in' && w.to.index >= selectedGate.inputsCount) return false;
         if (w.from.gateId === selectedGate.id && selectedGate.type === 'OUTPUT_LED' && w.from.type === 'out') return false;
@@ -1174,11 +1301,17 @@ function applyGateConfig() {
         return true;
     });
 
+    updateWireGeometryCache(); // Sincroniza a malha geométrica após mutação de configuração
     closeConfig(); 
 }
 
+// Inicializador de Loops Concorrentes da Aplicação
 function loop() { evaluateCircuit(); render(); requestAnimationFrame(loop); } 
+
+// Força a primeira carga de geometria para estabilização inicial dos fios criados estaticamente
+updateWireGeometryCache();
 requestAnimationFrame(loop);
+
 const gateSelectElement = document.getElementById('gate-type-select');
 if (gateSelectElement) {
     if (!gateSelectElement.querySelector('option[value="HEX_DISPLAY"]')) {
